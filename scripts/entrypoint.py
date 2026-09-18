@@ -35,7 +35,7 @@ def run(cmd, cwd=None):
 def main():
     if needs_bootstrap():
         print("Integrated tables empty/missing — bootstrapping pipeline...", flush=True)
-        run([sys.executable, "generate_data.py"], cwd=os.path.join(HERE, ".."))
+        run([sys.executable, "generate_data.py"], cwd=os.path.join(HERE, "..", "data"))
         run([sys.executable, "run_pipeline.py"], cwd=HERE)
     else:
         print("Integrated tables already populated — skipping bootstrap.", flush=True)
