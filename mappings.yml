@@ -1,0 +1,125 @@
+# FleetGuard lineage & mapping spec
+#
+# This file is the source of truth for "where did this number come from."
+# Every target field lists its source table/field, the transformation
+# applied, and (where relevant) the business rule that defines it.
+# scripts/render_lineage.py turns this into the human-readable table shown
+# in the dashboard's Lineage tab and in docs/lineage.md.
+
+version: 1
+
+tables:
+
+  asset_crosswalk:
+    description: >
+      Canonical ID resolution table. Built once from raw_asset_registry.
+      Every other table joins to it via normalized keys, never via raw IDs.
+    fields:
+      - target_field: asset_id
+        source: raw_asset_registry.asset_id
+        transform: none — this is the canonical ID, assigned by the registry.
+      - target_field: vin_or_unit_no_key
+        source: raw_asset_registry.vin_or_unit_no
+        transform: >
+          normalize_vin_or_unit(): uppercase, strip an optional "VIN-"
+          prefix, and collapse "UNIT<digits>" / "unit-<digits>" variants to
+          "UNIT-<digits>". Used as the join key against raw_service_tickets.
+      - target_field: device_id_key
+        source: raw_asset_registry.device_id
+        transform: >
+          normalize_device_id(): strip any "DEV-"/"dev_" prefix, keep only
+          digits, zero-pad to 6 and re-prefix "DEV-". Used as the join key
+          against raw_telemetry.
+      - target_field: asset_serial_key
+        source: raw_asset_registry.asset_serial
+        transform: >
+          normalize_asset_serial(): uppercase and ensure a leading "SN-".
+          Used as the join key against raw_warranty_claims.
+
+  component_taxonomy_map:
+    description: >
+      Reference table (integration-team-maintained, not derived from a
+      source system) mapping the warranty-claims component taxonomy to the
+      canonical service-ticket taxonomy. Codes absent from this table
+      (e.g. "misc_repair", "unclassified") are intentionally left unmapped
+      so the DQ layer can surface them rather than guessing a mapping.
+    fields:
+      - target_field: claim_component_code -> canonical_component
+        source: manually curated (business/domain knowledge)
+        transform: static lookup table, 10 of the known claim codes mapped 1:1.
+
+  dim_asset:
+    description: One row per canonical asset.
+    fields:
+      - target_field: asset_id
+        source: asset_crosswalk.asset_id
+        transform: none
+      - target_field: model
+        source: asset_crosswalk.model (originally raw_asset_registry.model)
+        transform: none
+
+  fact_telemetry_readings:
+    description: Cleaned telemetry, resolved to canonical asset_id.
+    fields:
+      - target_field: asset_id
+        source: raw_telemetry.device_id
+        transform: >
+          Joined via normalize_device_id(raw_telemetry.device_id) =
+          asset_crosswalk.device_id_key.
+      - target_field: reading_ts
+        source: raw_telemetry.timestamp
+        transform: cast to timestamp (telemetry timestamps are already ISO 8601).
+      - target_field: temperature_c / vibration_index
+        source: raw_telemetry.temperature_c / vibration_index
+        transform: cast to float8; NULL or empty-string values pass through as NULL.
+      - target_field: is_outlier
+        source: derived
+        transform: >
+          TRUE when temperature_c is NULL or outside [-40, 150] C, or when
+          vibration_index is NULL or outside [0, 5]. Rows are flagged, never
+          dropped — outliers are a DQ signal, not noise to discard.
+
+  fact_failure_events:
+    description: >
+      One row per reconciled failure event. Built in scripts/transform.py
+      (pandas), not pure SQL, because the reconciliation rule requires
+      stateful clustering per asset that is impractical as a single query.
+    business_rule: >
+      A "failure event" is any of: a service ticket, a telemetry reading
+      carrying a non-null error_code, or a warranty claim — each resolved to
+      a canonical asset_id. Events on the SAME asset_id whose dates fall
+      within a rolling 7-day window of each other (chained: if B is within
+      7 days of A, and C is within 7 days of B, all three merge into one
+      event even if C is >7 days from A) are reconciled into a single
+      fact_failure_events row. source_systems_present records which of the
+      three systems contributed evidence.
+    fields:
+      - target_field: asset_id
+        source: raw_service_tickets / raw_telemetry / raw_warranty_claims
+        transform: resolved via asset_crosswalk (see normalize_* functions above).
+      - target_field: event_date
+        source: reported_date / timestamp / claim_date (mixed formats)
+        transform: >
+          Parsed with dateutil.parser (handles MM/DD/YYYY, ISO 8601,
+          DD-Mon-YYYY, and ISO with time) into a single date; the earliest
+          date in a reconciled cluster is used as the event date.
+      - target_field: component
+        source: component_flagged (tickets) / component_claimed (claims, via
+          component_taxonomy_map)
+        transform: >
+          Ticket/claim components in a cluster take priority over telemetry
+          (which carries no component). If a claim's code has no taxonomy
+          mapping, the component is recorded as "Unmapped: <code>" and the
+          row is flagged. If no ticket or claim contributed a component at
+          all (telemetry-only cluster), component is "Unclassified".
+      - target_field: source_systems_present
+        source: derived
+        transform: distinct list of source systems (service_ticket / telemetry / warranty_claim) in the cluster.
+      - target_field: data_quality_flag
+        source: derived
+        transform: >
+          'orphan_claim' if the cluster is warranty_claim-only (no
+          supporting ticket or telemetry evidence); 'unmapped_taxonomy' if
+          any claim component code had no taxonomy mapping;
+          'missing_component' if no component could be determined at all;
+          otherwise 'ok'.

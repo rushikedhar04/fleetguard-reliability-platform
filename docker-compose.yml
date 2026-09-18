@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: fleetguard_pg
+    environment:
+      POSTGRES_USER: fleetguard
+      POSTGRES_PASSWORD: fleetguard
+      POSTGRES_DB: fleetguard
+    ports:
+      - "5433:5432"
+    volumes:
+      - fleetguard_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fleetguard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  fleetguard_pgdata:
